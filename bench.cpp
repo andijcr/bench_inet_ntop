@@ -7,6 +7,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <cstring>
+#include <bitset>
 
 // glibc adapter: assume out has enough space
 auto glibc_method(std::string &out, ::in6_addr const &in) {
@@ -152,22 +154,161 @@ auto fmt_method_v2(::in6_addr const &in) -> std::string {
                      fmt::join(std::span{best.end(), words.end()}, ":"));
 }
 
+consteval auto hex_lookup() {
+    std::array<char, 256*2> buf;
+    auto hex = "0123456789abcdef";
+
+    for (auto i = 0; i < 256; i++) {
+        buf[i*2  ] = hex[i >> 4];
+        buf[i*2+1] = hex[i & 15];
+    }
+    return buf;
+}
+
+
+struct run {
+    int8_t start : 4 = -1;
+    uint8_t len  : 4 =  0;
+
+    constexpr auto operator<=>(const run& other) const {
+        if (len != other.len)
+            return len <=> other.len;
+        return other.start <=> start;
+    }
+    constexpr bool operator==(const run& other) const = default;
+
+    constexpr operator bool() const { return *this != run{}; }
+};
+static_assert(run{} == run{});      // invalid == invalid
+static_assert(run{} < run{0,1});    // invalid < any valid
+static_assert(run{0,1} < run{0,2}); // short run < long run
+static_assert(run{0,1} > run{2,1}); // left run > right run
+static_assert(sizeof(run) == 1);
+
+consteval auto precompute_runs() {
+    std::array<run, 256> runs {};
+
+    for (auto i = 0; i < 256; i++) {
+        run current;
+        run best;
+        for (auto j = 7; j >= 0; j--) {
+            if ((i & (1<<j)) == 0) {
+                if (!current)
+                    current.start = 7-j;
+                current.len++;
+                if (best < current)
+                    best = current;
+            }
+            else
+                current = {};
+        }
+        if (best.len == 1)
+            best = {};
+
+        runs[i] = best;
+    }
+    return runs;
+}
+constexpr auto precomputed_runs = precompute_runs();
+static_assert(precomputed_runs[0b11111111] == run{});
+static_assert(precomputed_runs[0b00000000] == run{0,8});
+static_assert(precomputed_runs[0b00000001] == run{0,7});
+static_assert(precomputed_runs[0b01010101] == run{});
+static_assert(precomputed_runs[0b01001101] == run{2,2});
+static_assert(precomputed_runs[0b00101101] == run{0,2});
+static_assert(precomputed_runs[0b10001000] == run{1,3});
+static_assert(precomputed_runs[0b11001000] == run{5,3});
+static_assert(precomputed_runs[0b01000100] == run{2,3});
+static_assert(precomputed_runs[0b01000100] == run{2,3});
+static_assert(sizeof(precomputed_runs) == 256);
+
+auto izas_method(::in6_addr const &in) -> std::string {
+    const auto *src16 = reinterpret_cast<const uint16_t *>(&in);
+    const auto *src8  = reinterpret_cast<const uint8_t  *>(&in);
+
+    std::array<uint16_t, 8> buf16;
+    std::bitset<8> zeros;
+    for (auto i = 0; i < buf16.size(); i++) {
+        buf16[i] = __builtin_bswap16(src16[i]);
+        zeros[7-i] = buf16[i] != 0;
+    }
+
+    auto best_run = precomputed_runs[zeros.to_ulong()];
+
+    char out[40] {};
+    char *ptr = out;
+
+    auto to_hex = [](auto val, char *ptr) {
+        constexpr auto hex = hex_lookup();
+
+        auto write = [&](auto val) {
+            memcpy(ptr, hex.data() + val*2, 2);
+            ptr += 2;
+        };
+        auto hi = val >> 8;
+        auto lo = val & 255;
+
+        if (val < 0xf)
+            *ptr++ = "0123456789abcdef"[lo];
+        else if (val < 0xff)
+            write(lo);
+        else if (val < 0xfff) {
+            *ptr++ = "0123456789abcdef"[hi];
+            write(lo);
+        }
+        else {
+            write(hi);
+            write(lo);
+        }
+        return ptr;
+    };
+
+    // annoying special cases
+    if (best_run == run{0,8})
+        return "::";
+    if (best_run == run{0,6})
+        return fmt::format("::{}.{}.{}.{}", src8[12], src8[13], src8[14], src8[15]);
+    if (best_run == run{0,5} && buf16[5] == 0xffff)
+        return fmt::format("::ffff:{}.{}.{}.{}", src8[12], src8[13], src8[14], src8[15]);
+
+    for (auto i = 0; i < 8; i++) {
+        if (i == best_run.start) {
+            if (i == 0) // no previous run added a :
+                *ptr++ = ':';
+            i += best_run.len - 1;
+        }
+        else
+            ptr = to_hex(buf16[i], ptr);
+
+        if (i < 7)
+            *ptr++ = ':';
+    }
+    return out;
+}
+
+constexpr static auto string_addresses = std::array{
+    "::ffff:123.123.123.123",
+    "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+    "2001:db8::1:0",
+    "2001:db8:0:1:1:1:1:1",
+    "2001:db8:1234:ffff:ffff:ffff:ffff:ffff",
+    "2001:db8:85a3:8d3:1319:8a2e:370:7348",
+    "fe80::1ff:fe23:4567:890a",
+    "64:ff9b::255.255.255.255",
+    "2001:db8:3333:4444:5555:6666:7777:8888",
+    "2001:db8::123.123.123.123",
+    "2001:db8::1234:5678:5.6.7.8",
+    "::1",
+    "::",
+    "::123.123.123.123",
+    ":ffff:123.123.123.123",
+    "1:0:1:0:1:0:1:0",
+    "0:1:0:1:0:1:0:1",
+    "1:1:1:1:1:0:1:1",
+    "1:1:1:1:1:0:0:1",
+};
 auto addresses() {
-  auto data = std::array{
-      "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
-      "2001:db8::1:0",
-      "2001:db8:0:1:1:1:1:1",
-      "2001:db8:1234:ffff:ffff:ffff:ffff:ffff",
-      "2001:db8:85a3:8d3:1319:8a2e:370:7348",
-      "fe80::1ff:fe23:4567:890a",
-      "64:ff9b::255.255.255.255",
-      "2001:db8:3333:4444:5555:6666:7777:8888",
-      "2001:db8::123.123.123.123",
-      "2001:db8::1234:5678:5.6.7.8",
-      "::1",
-      "::",
-      "::123.123.123.123",
-  };
+  auto data = string_addresses;
 
   auto out = std::array<::in6_addr, data.size()>{};
   std::ranges::copy(data | std::views::transform([](const char *in) {
@@ -193,30 +334,40 @@ static void BM_runner(benchmark::State &state,
         glibc_method(out, addr);
       } else if constexpr (v == 1) {
         benchmark::DoNotOptimize(manual_method(addr));
-      } else {
+      } else if constexpr (v == 2) {
         benchmark::DoNotOptimize(fmt_method_v2(addr));
+      } else {
+        benchmark::DoNotOptimize(izas_method(addr));
       }
     }
 }
 
 BENCHMARK_CAPTURE(BM_runner, glibc, std::integral_constant<size_t, 0>{});
-BENCHMARK_CAPTURE(BM_runner, fmt_v1, std::integral_constant<size_t, 1>{});
+BENCHMARK_CAPTURE(BM_runner, manual, std::integral_constant<size_t, 1>{});
 BENCHMARK_CAPTURE(BM_runner, fmt_v2, std::integral_constant<size_t, 2>{});
+BENCHMARK_CAPTURE(BM_runner, izas, std::integral_constant<size_t, 3>{});
 
 // BENCHMARK(BM_runner<1>);
 
 int main(int argc, char **argv) {
-  auto data = addresses();
+    auto data = addresses();
 
-  fmt::print("libc, fmt\n");
-  for (auto &addr : data) {
-    auto libc = std::string(INET6_ADDRSTRLEN, '\0');
-    glibc_method(libc, addr);
-    auto mine = fmt_method_v2(addr);
-    if (libc != mine) {
-      fmt::print("{}, {}\n", libc, mine);
+    fmt::print("{:39} {:39} {:39} {:39}\n", "string", "libc", "andrea", "iza");
+    for (auto i = 0; i < string_addresses.size(); i++) {
+        auto &addr = data[i];
+        auto libc = std::string(INET6_ADDRSTRLEN, '\0');
+        glibc_method(libc, addr);
+        auto andrea = fmt_method_v2(addr);
+        auto iza = izas_method(addr);
+        if (iza != andrea)
+            fmt::print("\x1b[41m");
+        else
+            fmt::print("\x1b[42m");
+        fmt::print("{:39} {:39} {:39} {:39}", string_addresses[i], libc, andrea, iza);
+        fmt::print("\x1b[m\n");
+
     }
-  }
+
   fmt::print("----\n");
   ::benchmark::Initialize(&argc, argv);
   if (::benchmark::ReportUnrecognizedArguments(argc, argv))
