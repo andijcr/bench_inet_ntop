@@ -235,7 +235,7 @@ auto izas_method(::in6_addr const &in) -> std::string {
 
     auto best_run = precomputed_runs[zeros.to_ulong()];
 
-    char out[40] {};
+    char out[46] {};
     char *ptr = out;
 
     auto to_hex = [](auto val, char *ptr) {
